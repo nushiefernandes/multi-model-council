@@ -262,6 +262,16 @@ class ModelProvider(ABC):
         """
         pass
 
+    @abstractmethod
+    async def list_models(self) -> list[str]:
+        """
+        List available models from this provider.
+
+        Returns:
+            List of model IDs available from the provider's API.
+        """
+        pass
+
     def count_tokens(self, text: str) -> int:
         """Estimate token count (rough approximation: 1 token ≈ 4 chars)."""
         return len(text) // 4
@@ -462,10 +472,32 @@ class AnthropicProvider(ModelProvider):
 
         raise last_error or ValueError("Structured completion failed")
 
+    async def list_models(self) -> list[str]:
+        """List available models from Anthropic API."""
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{self.base_url}/models",
+                headers={
+                    "x-api-key": self.api_key,
+                    "anthropic-version": "2023-06-01"
+                },
+                timeout=30.0
+            )
+            response.raise_for_status()
+            data = response.json()
+            return [m["id"] for m in data["data"]]
+
 
 # =============================================================================
 # OPENAI PROVIDER (GPT-4)
 # =============================================================================
+
+# Fallback models when the requested model fails (400/404 errors)
+OPENAI_MODEL_FALLBACKS = {
+    "gpt-5.2": "gpt-4o",
+    "gpt-5.1": "gpt-4o",
+}
+
 
 class OpenAIProvider(ModelProvider):
     """
@@ -485,7 +517,7 @@ class OpenAIProvider(ModelProvider):
     And OpenAI guarantees valid JSON matching the schema.
     """
 
-    def __init__(self, model: str = "gpt-4o", api_key: Optional[str] = None):
+    def __init__(self, model: str = "gpt-5.2", api_key: Optional[str] = None):
         self.model = model
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
         if not self.api_key:
@@ -494,6 +526,15 @@ class OpenAIProvider(ModelProvider):
         # Cost per 1K tokens (GPT-4o pricing)
         self.cost_per_1k_input = 0.005
         self.cost_per_1k_output = 0.015
+
+    def _get_token_param(self, max_tokens: int) -> dict:
+        """
+        Get the correct token limit parameter for the model.
+        GPT-5.x models use 'max_completion_tokens', older models use 'max_tokens'.
+        """
+        if self.model.startswith("gpt-5"):
+            return {"max_completion_tokens": max_tokens}
+        return {"max_tokens": max_tokens}
 
     async def complete(
         self,
@@ -509,18 +550,20 @@ class OpenAIProvider(ModelProvider):
                 all_messages.append({"role": "system", "content": system})
             all_messages.extend(messages)
 
+            payload = {
+                "model": self.model,
+                "messages": all_messages,
+                "temperature": temperature,
+                **self._get_token_param(max_tokens)
+            }
+
             response = await client.post(
                 f"{self.base_url}/chat/completions",
                 headers={
                     "Authorization": f"Bearer {self.api_key}",
                     "Content-Type": "application/json"
                 },
-                json={
-                    "model": self.model,
-                    "messages": all_messages,
-                    "max_tokens": max_tokens,
-                    "temperature": temperature
-                },
+                json=payload,
                 timeout=120.0
             )
             response.raise_for_status()
@@ -547,6 +590,14 @@ class OpenAIProvider(ModelProvider):
                 all_messages.append({"role": "system", "content": system})
             all_messages.extend(messages)
 
+            payload = {
+                "model": self.model,
+                "messages": all_messages,
+                "temperature": temperature,
+                "stream": True,
+                **self._get_token_param(max_tokens)
+            }
+
             async with client.stream(
                 "POST",
                 f"{self.base_url}/chat/completions",
@@ -554,13 +605,7 @@ class OpenAIProvider(ModelProvider):
                     "Authorization": f"Bearer {self.api_key}",
                     "Content-Type": "application/json"
                 },
-                json={
-                    "model": self.model,
-                    "messages": all_messages,
-                    "max_tokens": max_tokens,
-                    "temperature": temperature,
-                    "stream": True
-                },
+                json=payload,
                 timeout=120.0
             ) as response:
                 async for line in response.aiter_lines():
@@ -583,6 +628,7 @@ class OpenAIProvider(ModelProvider):
         Structured completion using json_schema response format.
 
         OpenAI's native structured output support.
+        Includes automatic fallback to alternative models on 400/404 errors.
         """
         last_error = None
 
@@ -598,26 +644,28 @@ class OpenAIProvider(ModelProvider):
                     # OpenAI has strict requirements - must have additionalProperties: false
                     json_schema = make_openai_compatible_schema(get_json_schema(schema))
 
+                    payload = {
+                        "model": self.model,
+                        "messages": all_messages,
+                        "temperature": temperature,
+                        "response_format": {
+                            "type": "json_schema",
+                            "json_schema": {
+                                "name": schema.__name__,
+                                "strict": True,
+                                "schema": json_schema
+                            }
+                        },
+                        **self._get_token_param(max_tokens)
+                    }
+
                     response = await client.post(
                         f"{self.base_url}/chat/completions",
                         headers={
                             "Authorization": f"Bearer {self.api_key}",
                             "Content-Type": "application/json"
                         },
-                        json={
-                            "model": self.model,
-                            "messages": all_messages,
-                            "max_tokens": max_tokens,
-                            "temperature": temperature,
-                            "response_format": {
-                                "type": "json_schema",
-                                "json_schema": {
-                                    "name": schema.__name__,
-                                    "strict": True,
-                                    "schema": json_schema
-                                }
-                            }
-                        },
+                        json=payload,
                         timeout=120.0
                     )
                     response.raise_for_status()
@@ -635,6 +683,23 @@ class OpenAIProvider(ModelProvider):
 
                     return validated, usage
 
+            except httpx.HTTPStatusError as e:
+                # Handle model not found errors with fallback
+                if e.response.status_code in (400, 404) and self.model in OPENAI_MODEL_FALLBACKS:
+                    fallback = OPENAI_MODEL_FALLBACKS[self.model]
+                    print(f"Model {self.model} failed ({e.response.status_code}), falling back to {fallback}")
+                    self.model = fallback
+                    return await self.complete_structured(
+                        messages=messages,
+                        schema=schema,
+                        system=system,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        retries=retries
+                    )
+                last_error = e
+                if attempt == retries - 1:
+                    raise
             except ValidationError as e:
                 last_error = e
                 if attempt < retries - 1:
@@ -648,6 +713,18 @@ class OpenAIProvider(ModelProvider):
                     raise
 
         raise last_error or ValueError("Structured completion failed")
+
+    async def list_models(self) -> list[str]:
+        """List available models from OpenAI API."""
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{self.base_url}/models",
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                timeout=30.0
+            )
+            response.raise_for_status()
+            data = response.json()
+            return [m["id"] for m in data["data"]]
 
 
 # =============================================================================
@@ -833,6 +910,17 @@ IMPORTANT:
 
         raise last_error or ValueError("Structured completion failed")
 
+    async def list_models(self) -> list[str]:
+        """List available models from Ollama."""
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{self.base_url}/api/tags",
+                timeout=30.0
+            )
+            response.raise_for_status()
+            data = response.json()
+            return [m["name"] for m in data.get("models", [])]
+
 
 # =============================================================================
 # FACTORY FUNCTION
@@ -866,7 +954,7 @@ def get_provider(config: dict, provider_name: str) -> ModelProvider:
     elif provider_type == "openai":
         api_key = os.environ.get(provider_config.get("api_key_env", "OPENAI_API_KEY"))
         return OpenAIProvider(
-            model=provider_config.get("model", "gpt-4o"),
+            model=provider_config.get("model", "gpt-5.2"),
             api_key=api_key
         )
     elif provider_type == "ollama":
@@ -887,7 +975,7 @@ def get_anthropic(model: str = "claude-sonnet-4-20250514") -> AnthropicProvider:
     return AnthropicProvider(model=model)
 
 
-def get_openai(model: str = "gpt-4o") -> OpenAIProvider:
+def get_openai(model: str = "gpt-5.2") -> OpenAIProvider:
     """Quick way to get an OpenAI provider."""
     return OpenAIProvider(model=model)
 
@@ -895,3 +983,26 @@ def get_openai(model: str = "gpt-4o") -> OpenAIProvider:
 def get_ollama(model: str = "deepseek-coder-v2:16b") -> OllamaProvider:
     """Quick way to get an Ollama provider."""
     return OllamaProvider(model=model)
+
+
+async def discover_models(config: dict) -> dict[str, list[str]]:
+    """
+    Discover available models from all configured providers.
+
+    Args:
+        config: Configuration dict with models section
+
+    Returns:
+        Dict mapping provider type to list of available model IDs.
+        Example: {"anthropic": ["claude-..."], "openai": ["gpt-5.2", ...]}
+    """
+    results = {}
+    for name, provider_config in config.get("models", {}).items():
+        provider = get_provider(config, name)
+        provider_type = provider_config.get("provider")
+        try:
+            models = await provider.list_models()
+            results[provider_type] = models
+        except Exception as e:
+            results[provider_type] = [f"Error: {e}"]
+    return results
