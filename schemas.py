@@ -745,6 +745,75 @@ def get_json_schema(model: type[BaseModel]) -> dict:
     return model.model_json_schema()
 
 
+# =============================================================================
+# QUICK CONSENSUS SCHEMAS
+# =============================================================================
+# Lightweight schemas for fast multi-model consensus on simple questions.
+
+class ConsensusAnswer(BaseModel):
+    """
+    Individual model's answer to a question.
+
+    Used in: Quick consensus gathering phase
+
+    Example:
+        Question: "Redis vs Memcached for sessions?"
+        Answer: ConsensusAnswer(
+            answer="Redis is better for session caching",
+            confidence=8,
+            reasoning="Redis supports persistence, data structures, and pub/sub"
+        )
+    """
+    answer: str = Field(description="The model's answer")
+    confidence: int = Field(ge=1, le=10, description="Confidence 1-10")
+    reasoning: str = Field(description="Brief reasoning")
+
+
+class ConsensusEvaluation(BaseModel):
+    """
+    Model's evaluation of other answers (optional phase).
+
+    Used in: Quick consensus evaluation phase (when with_evaluation=True)
+
+    Example:
+        ConsensusEvaluation(
+            rankings=["B", "A", "C"],
+            best_answer="B",
+            explanation="Answer B correctly identifies the trade-offs"
+        )
+    """
+    rankings: list[str] = Field(description="Answer labels ranked best to worst")
+    best_answer: str = Field(description="Which answer label is best")
+    explanation: str = Field(description="Why this ranking")
+
+
+class ConsensusResult(BaseModel):
+    """
+    Final synthesized consensus.
+
+    Used in: Quick consensus output
+
+    Example:
+        ConsensusResult(
+            answer="Use Redis for session caching due to persistence and data structure support",
+            confidence=8,
+            agreement_level="strong",
+            dissenting_views=["One model preferred Memcached for simplicity"],
+            sources=["claude", "gpt4"]
+        )
+    """
+    answer: str = Field(description="The synthesized answer")
+    confidence: int = Field(ge=1, le=10, description="Consensus confidence")
+    agreement_level: Literal["unanimous", "strong", "moderate", "divided"] = Field(
+        description="How much the models agreed"
+    )
+    dissenting_views: list[str] = Field(
+        default_factory=list,
+        description="Notable disagreements or alternative views"
+    )
+    sources: list[str] = Field(description="Which models contributed")
+
+
 # List of all schemas for easy iteration
 ALL_SCHEMAS = [
     # Deliberation schemas
@@ -759,6 +828,10 @@ ALL_SCHEMAS = [
     AgentResponse,
     DeliberationPhase,
     DeliberationTranscript,
+    # Quick consensus schemas
+    ConsensusAnswer,
+    ConsensusEvaluation,
+    ConsensusResult,
     # Tool schemas
     ToolParameter,
     ToolDefinition,

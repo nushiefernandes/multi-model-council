@@ -42,6 +42,9 @@ from schemas import (
     AgentResponse,
     DeliberationPhase,
     DeliberationTranscript,
+    ConsensusAnswer,
+    ConsensusEvaluation,
+    ConsensusResult,
 )
 from providers import ModelProvider, get_provider
 
@@ -577,6 +580,189 @@ Provide a thorough review:
 
         return review
 
+    # =========================================================================
+    # QUICK CONSENSUS
+    # =========================================================================
+
+    async def quick_consensus(
+        self,
+        question: str,
+        models: list[str] = None,
+        with_evaluation: bool = False,
+        chairman: str = None
+    ) -> ConsensusResult:
+        """
+        Fast multi-model consensus for simple questions.
+
+        This is a lightweight alternative to full deliberation for quick decisions.
+        Inspired by llm-council but uses native provider APIs and fits the existing
+        architecture.
+
+        Flow:
+        1. Query all models in parallel (5-10s)
+        2. (Optional) Each model evaluates others
+        3. Chairman synthesizes final answer
+
+        Args:
+            question: The question to get consensus on
+            models: List of model names to query (default: all configured models)
+            with_evaluation: If True, adds peer evaluation phase (slower but more robust)
+            chairman: Model to synthesize final answer (default: first model)
+
+        Returns:
+            ConsensusResult with synthesized answer and agreement info
+
+        Example:
+            result = await engine.quick_consensus(
+                "Should we use REST or GraphQL for this API?",
+                models=["claude", "gpt4"]
+            )
+            print(result.answer)
+        """
+        # Default: use all models from config
+        models = models or list(self.config.get("models", {}).keys())
+        if not models:
+            raise ValueError("No models configured")
+
+        chairman = chairman or models[0]
+
+        # Stage 1: Gather answers from all models in parallel
+        system_prompt = """You are an expert providing a concise, direct answer to a technical question.
+Be specific and practical. Rate your confidence from 1 (uncertain) to 10 (very confident)."""
+
+        prompt = f"""Question: {question}
+
+Please provide:
+1. Your direct answer to the question
+2. Your confidence level (1-10)
+3. Brief reasoning for your answer"""
+
+        async def get_answer(model_name: str) -> tuple[str, ConsensusAnswer]:
+            agent = self._get_agent(model_name)
+            answer, _ = await self._agent_respond_structured(
+                agent=agent,
+                prompt=prompt,
+                schema=ConsensusAnswer,
+                system=system_prompt
+            )
+            return model_name, answer
+
+        # Run all queries in parallel
+        tasks = [get_answer(model_name) for model_name in models]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Collect successful answers
+        answers: list[tuple[str, ConsensusAnswer]] = []
+        for result in results:
+            if isinstance(result, Exception):
+                print(f"Warning: Answer failed: {result}")
+                continue
+            answers.append(result)
+
+        if not answers:
+            raise RuntimeError("All models failed to provide answers")
+
+        # Stage 2: Optional peer evaluation
+        evaluations: list[tuple[str, ConsensusEvaluation]] = []
+        if with_evaluation and len(answers) > 1:
+            # Format answers for evaluation (anonymized with labels)
+            answers_text = ""
+            label_to_model = {}
+            for i, (model_name, answer) in enumerate(answers):
+                label = chr(65 + i)  # A, B, C, ...
+                label_to_model[label] = model_name
+                answers_text += f"""
+Answer {label}:
+- Answer: {answer.answer}
+- Confidence: {answer.confidence}/10
+- Reasoning: {answer.reasoning}
+"""
+
+            eval_system = """You are evaluating multiple answers to a question.
+Rank them from best to worst based on accuracy, completeness, and practicality."""
+
+            eval_prompt = f"""Question: {question}
+
+Here are the anonymized answers:
+{answers_text}
+
+Please rank these answers from best to worst and explain your ranking."""
+
+            async def get_evaluation(model_name: str) -> tuple[str, ConsensusEvaluation]:
+                agent = self._get_agent(model_name)
+                evaluation, _ = await self._agent_respond_structured(
+                    agent=agent,
+                    prompt=eval_prompt,
+                    schema=ConsensusEvaluation,
+                    system=eval_system
+                )
+                return model_name, evaluation
+
+            eval_tasks = [get_evaluation(model_name) for model_name in models]
+            eval_results = await asyncio.gather(*eval_tasks, return_exceptions=True)
+
+            for result in eval_results:
+                if isinstance(result, Exception):
+                    print(f"Warning: Evaluation failed: {result}")
+                    continue
+                evaluations.append(result)
+
+        # Stage 3: Chairman synthesizes final answer
+        synthesis_system = """You are synthesizing multiple expert answers into a single consensus response.
+Identify agreement, note any important dissenting views, and provide a clear final answer."""
+
+        answers_summary = ""
+        for model_name, answer in answers:
+            answers_summary += f"""
+{model_name}'s Answer:
+- Answer: {answer.answer}
+- Confidence: {answer.confidence}/10
+- Reasoning: {answer.reasoning}
+"""
+
+        eval_summary = ""
+        if evaluations:
+            eval_summary = "\n\nPeer Evaluations:\n"
+            for model_name, evaluation in evaluations:
+                eval_summary += f"""
+{model_name}'s Ranking: {' > '.join(evaluation.rankings)}
+Best Answer: {evaluation.best_answer}
+Explanation: {evaluation.explanation}
+"""
+
+        synthesis_prompt = f"""Question: {question}
+
+Expert Answers:
+{answers_summary}
+{eval_summary}
+
+Please synthesize these answers into a final consensus:
+1. Provide the synthesized answer
+2. Rate overall consensus confidence (1-10)
+3. Assess agreement level (unanimous/strong/moderate/divided)
+4. Note any important dissenting views
+5. List which models contributed"""
+
+        chairman_agent = self._get_agent(chairman)
+        consensus, _ = await self._agent_respond_structured(
+            agent=chairman_agent,
+            prompt=synthesis_prompt,
+            schema=ConsensusResult,
+            system=synthesis_system
+        )
+
+        # Ensure sources are populated if the model didn't include them
+        if not consensus.sources:
+            consensus = ConsensusResult(
+                answer=consensus.answer,
+                confidence=consensus.confidence,
+                agreement_level=consensus.agreement_level,
+                dissenting_views=consensus.dissenting_views,
+                sources=[model_name for model_name, _ in answers]
+            )
+
+        return consensus
+
     def get_transcript(self) -> Optional[DeliberationTranscript]:
         """Get the transcript from the last deliberation session."""
         return self._transcript
@@ -599,9 +785,9 @@ def create_default_config() -> dict:
                 "model": "claude-sonnet-4-20250514",
                 "api_key_env": "ANTHROPIC_API_KEY"
             },
-            "gpt4": {
+            "gpt4": {  # Keep key name for backwards compat
                 "provider": "openai",
-                "model": "gpt-4o",
+                "model": "gpt-5.2",  # Updated from gpt-4o
                 "api_key_env": "OPENAI_API_KEY"
             },
             "deepseek": {
@@ -645,3 +831,28 @@ async def quick_review(code: str) -> CodeReview:
     config = create_default_config()
     engine = Deliberation(config)
     return await engine.quality_review(code)
+
+
+async def quick_ask(question: str, models: list[str] = None) -> ConsensusResult:
+    """
+    Quickest way to get multi-model consensus.
+
+    This is a convenience function for simple questions that need
+    quick multi-model agreement. Skips peer evaluation for speed.
+
+    Args:
+        question: The question to get consensus on
+        models: Optional list of model names (default: all configured)
+
+    Returns:
+        ConsensusResult with the synthesized answer
+
+    Example:
+        answer = await quick_ask("Redis vs Memcached for session caching?")
+        print(answer.answer)
+        print(f"Confidence: {answer.confidence}/10")
+        print(f"Agreement: {answer.agreement_level}")
+    """
+    config = create_default_config()
+    engine = Deliberation(config)
+    return await engine.quick_consensus(question, models=models, with_evaluation=False)

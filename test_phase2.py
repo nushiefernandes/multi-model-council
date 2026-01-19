@@ -38,6 +38,8 @@ from schemas import (
     RoleDeliberationResult,
     Plan,
     CodeReview,
+    ConsensusAnswer,
+    ConsensusResult,
 )
 from deliberation import (
     Deliberation,
@@ -45,6 +47,7 @@ from deliberation import (
     create_default_config,
     quick_deliberate_roles,
     quick_review,
+    quick_ask,
 )
 
 
@@ -465,6 +468,94 @@ async def test_results_differ():
 
 
 # =============================================================================
+# TEST 7: QUICK CONSENSUS
+# =============================================================================
+
+async def test_quick_consensus():
+    """
+    Test quick consensus for simple questions.
+
+    This verifies:
+    - Quick consensus returns a valid ConsensusResult
+    - Answer and confidence are populated
+    - Agreement level is valid
+    - Sources list the models that contributed
+    """
+    print("\n" + "=" * 60)
+    print("TEST 7: Quick Consensus")
+    print("=" * 60)
+
+    if not has_anthropic_key():
+        print("SKIP: ANTHROPIC_API_KEY not set")
+        return False
+
+    config = CLAUDE_ONLY_CONFIG
+    delib = Deliberation(config)
+
+    print("Asking quick consensus question: 'Redis vs Memcached for session caching?'")
+    result = await delib.quick_consensus(
+        "Redis vs Memcached for session caching?",
+        models=["claude"],
+        with_evaluation=False
+    )
+
+    print(f"\n--- Quick Consensus Result ---")
+    assert isinstance(result, ConsensusResult), f"Expected ConsensusResult, got {type(result)}"
+
+    print(f"Answer: {result.answer[:200]}...")
+    print(f"Confidence: {result.confidence}/10")
+    print(f"Agreement Level: {result.agreement_level}")
+    print(f"Sources: {result.sources}")
+    print(f"Dissenting Views: {len(result.dissenting_views)}")
+
+    # Verify the result has required fields
+    assert result.answer, "Answer should not be empty"
+    assert 1 <= result.confidence <= 10, f"Confidence out of range: {result.confidence}"
+    assert result.agreement_level in ["unanimous", "strong", "moderate", "divided"], \
+        f"Invalid agreement level: {result.agreement_level}"
+    assert len(result.sources) >= 1, "Expected at least 1 source"
+
+    print("\n✅ Test 7 PASSED: Quick consensus works")
+    return True
+
+
+async def test_quick_ask_convenience():
+    """
+    Test the quick_ask convenience function.
+
+    This verifies:
+    - quick_ask returns a valid ConsensusResult
+    - Works with default configuration
+    """
+    print("\n" + "=" * 60)
+    print("TEST 8: quick_ask Convenience Function")
+    print("=" * 60)
+
+    if not has_anthropic_key():
+        print("SKIP: ANTHROPIC_API_KEY not set")
+        return False
+
+    print("Using quick_ask: 'Should I use REST or GraphQL for a simple CRUD API?'")
+    result = await quick_ask(
+        "Should I use REST or GraphQL for a simple CRUD API?",
+        models=["claude"]
+    )
+
+    print(f"\n--- quick_ask Result ---")
+    assert isinstance(result, ConsensusResult), f"Expected ConsensusResult, got {type(result)}"
+
+    print(f"Answer: {result.answer[:200]}...")
+    print(f"Confidence: {result.confidence}/10")
+    print(f"Agreement: {result.agreement_level}")
+
+    assert result.answer, "Answer should not be empty"
+    assert 1 <= result.confidence <= 10
+
+    print("\n✅ Test 8 PASSED: quick_ask convenience function works")
+    return True
+
+
+# =============================================================================
 # MULTI-MODEL TEST (if both keys available)
 # =============================================================================
 
@@ -476,7 +567,7 @@ async def test_multi_model_deliberation():
     proposing and critiquing each other.
     """
     print("\n" + "=" * 60)
-    print("TEST 7: Multi-Model Deliberation (Claude + GPT-4)")
+    print("TEST 9: Multi-Model Deliberation (Claude + GPT-4)")
     print("=" * 60)
 
     if not has_anthropic_key() or not has_openai_key():
@@ -510,7 +601,7 @@ async def test_multi_model_deliberation():
             for resp in phase.responses:
                 print(f"  - {resp.agent_name}: {resp.tokens_used} tokens, ${resp.cost:.4f}")
 
-    print("\n✅ Test 7 PASSED: Multi-model deliberation works")
+    print("\n✅ Test 9 PASSED: Multi-model deliberation works")
     return True
 
 
@@ -539,6 +630,8 @@ async def run_all_tests():
         ("Planning Deliberation", test_deliberate_plan),
         ("Code Review", test_quality_review),
         ("Verify Not Hardcoded", test_results_differ),
+        ("Quick Consensus", test_quick_consensus),
+        ("quick_ask Convenience", test_quick_ask_convenience),
     ]
 
     for name, test_fn in tests:

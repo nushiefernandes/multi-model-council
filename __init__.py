@@ -10,7 +10,8 @@ PHASES:
 ------
 Phase 1: Schemas and Providers (complete)
 Phase 2: Real Deliberation Engine (complete)
-Phase 3: Execution Layer (planned)
+Phase 3: Execution Layer (complete)
+Phase 4: CLI Interface (complete)
 """
 
 __version__ = "2.0.0-alpha"
@@ -26,6 +27,8 @@ from .schemas import (
     CodeReview,
     ReviewIssue,
     DeliberationTranscript,
+    ConsensusResult,
+    ExecutionResult,
 )
 
 from .providers import (
@@ -43,7 +46,27 @@ from .deliberation import (
     create_default_config,
     quick_deliberate_roles,
     quick_review,
+    quick_ask,
 )
+
+from .execution import (
+    ExecutionEngine,
+    ToolRegistry,
+    execute_plan_interactive,
+    execute_plan_headless,
+)
+
+from .session import (
+    Session,
+    SessionManager,
+    WorkflowPhase,
+    create_session,
+    load_session,
+    save_session,
+    list_sessions,
+)
+
+from .cli import main as cli_main
 
 __all__ = [
     # Schemas
@@ -56,6 +79,8 @@ __all__ = [
     "CodeReview",
     "ReviewIssue",
     "DeliberationTranscript",
+    "ConsensusResult",
+    "ExecutionResult",
     # Providers
     "ModelProvider",
     "AnthropicProvider",
@@ -69,4 +94,20 @@ __all__ = [
     "create_default_config",
     "quick_deliberate_roles",
     "quick_review",
+    "quick_ask",
+    # Execution
+    "ExecutionEngine",
+    "ToolRegistry",
+    "execute_plan_interactive",
+    "execute_plan_headless",
+    # Session
+    "Session",
+    "SessionManager",
+    "WorkflowPhase",
+    "create_session",
+    "load_session",
+    "save_session",
+    "list_sessions",
+    # CLI
+    "cli_main",
 ]
