@@ -751,6 +751,139 @@ def show_thinking(message: str = "Thinking..."):
 
 
 # =============================================================================
+# LIVE PROGRESS TRACKING (Phase 7)
+# =============================================================================
+
+class TokenCostTracker:
+    """
+    Track tokens and cost in real-time during deliberation.
+
+    This provides live feedback on API usage while operations are running.
+    """
+
+    def __init__(self):
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.cost = 0.0
+        self.completed_models: list[str] = []
+
+    def update(self, input_t: int = 0, output_t: int = 0, cost: float = 0.0):
+        """Update token and cost counts."""
+        self.input_tokens += input_t
+        self.output_tokens += output_t
+        self.cost += cost
+
+    def mark_model_done(self, model_name: str):
+        """Mark a model as completed."""
+        if model_name not in self.completed_models:
+            self.completed_models.append(model_name)
+
+    def render(self) -> str:
+        """Render the current stats as a string."""
+        return f"Tokens: {self.input_tokens:,}+{self.output_tokens:,} | ${self.cost:.4f}"
+
+    def render_with_progress(self, total_models: int) -> str:
+        """Render stats with model completion progress."""
+        completed = len(self.completed_models)
+        return f"({completed}/{total_models} models) | {self.render()}"
+
+
+from contextlib import contextmanager
+from rich.live import Live
+
+
+@contextmanager
+def show_live_progress(message: str, tracker: TokenCostTracker = None, total_models: int = 0):
+    """
+    Context manager that shows a spinner with optional live token/cost stats.
+
+    Usage:
+        tracker = TokenCostTracker()
+        with show_live_progress("Deliberating...", tracker, total_models=3) as update:
+            # Do work, call update() periodically
+            tracker.update(input_t=100, output_t=50, cost=0.001)
+            update()  # Refresh the display
+
+    Args:
+        message: The message to display
+        tracker: Optional TokenCostTracker for live stats
+        total_models: Total number of models (for progress display)
+    """
+    spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    frame_idx = [0]  # Use list to allow mutation in nested function
+
+    def render_display(msg: str = None) -> Text:
+        """Render the current display."""
+        display_msg = msg or message
+        frame = spinner_frames[frame_idx[0] % len(spinner_frames)]
+        frame_idx[0] += 1
+
+        text = Text()
+        text.append(f"{frame} ", style="blue")
+        text.append(display_msg, style="bold blue")
+
+        if tracker:
+            text.append("\n  ")
+            if total_models > 0:
+                text.append(tracker.render_with_progress(total_models), style="dim")
+            else:
+                text.append(tracker.render(), style="dim")
+
+        return text
+
+    with Live(render_display(), console=console, refresh_per_second=4, transient=True) as live:
+        def update(msg: str = None):
+            """Update the display with new message or refreshed stats."""
+            live.update(render_display(msg))
+
+        yield update
+
+    # Show final state after completion
+    if tracker:
+        final_text = Text()
+        final_text.append("✓ ", style="green")
+        final_text.append(message, style="green")
+        final_text.append(f" ({tracker.render()})", style="dim")
+        console.print(final_text)
+
+
+@contextmanager
+def show_streaming_code(title: str, language: str = "python"):
+    """
+    Context manager for streaming code generation display.
+
+    Usage:
+        with show_streaming_code("Generating user_service.py", "python") as add_chunk:
+            for chunk in stream:
+                add_chunk(chunk)
+
+    Args:
+        title: Title to display above the code
+        language: Programming language for syntax highlighting
+    """
+    console.print(f"\n[bold]{title}[/bold]")
+    console.print("─" * 40)
+
+    code_buffer = [""]  # Use list for mutation in nested function
+
+    with Live(console=console, refresh_per_second=10, transient=True) as live:
+        def add_chunk(chunk: str):
+            """Add a chunk of code to the display."""
+            code_buffer[0] += chunk
+            # Show syntax highlighted code with cursor
+            syntax = Syntax(code_buffer[0] + "█", language, theme="monokai", line_numbers=False)
+            live.update(syntax)
+
+        yield add_chunk
+
+    # Show final code without cursor
+    if code_buffer[0]:
+        final_syntax = Syntax(code_buffer[0], language, theme="monokai", line_numbers=True)
+        console.print(final_syntax)
+        console.print("─" * 40)
+
+
+# =============================================================================
 # SESSION LIST DISPLAY
 # =============================================================================
 

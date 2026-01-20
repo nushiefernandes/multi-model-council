@@ -63,6 +63,129 @@ from config import (
 )
 from workspace import WorkspaceManager
 import ui
+import os
+
+
+# =============================================================================
+# MODEL VALIDATION
+# =============================================================================
+
+def validate_models(config_obj: Config, requested_models: list[str]) -> tuple[bool, list[str]]:
+    """
+    Validate that requested models exist in config.
+
+    Args:
+        config_obj: Loaded configuration
+        requested_models: List of model names to validate
+
+    Returns:
+        (all_valid, list of error messages)
+    """
+    errors = []
+    available = config_obj.list_models()
+
+    for model in requested_models:
+        if model not in available:
+            errors.append(f"Model '{model}' not found in config. Available: {', '.join(available)}")
+
+    return len(errors) == 0, errors
+
+
+def check_api_keys(config_obj: Config, requested_models: list[str]) -> tuple[bool, list[str]]:
+    """
+    Check that required API keys are available for requested models.
+
+    Args:
+        config_obj: Loaded configuration
+        requested_models: List of model names to check
+
+    Returns:
+        (all_available, list of warning messages)
+    """
+    warnings = []
+
+    for model_name in requested_models:
+        model_config = config_obj.get_model(model_name)
+        if not model_config:
+            continue
+
+        # Skip Ollama models (no API key needed)
+        if model_config.provider == "ollama":
+            continue
+
+        # Check if API key env var is set
+        api_key_env = model_config.api_key_env
+        if api_key_env and not os.environ.get(api_key_env):
+            warnings.append(
+                f"Model '{model_name}' requires {api_key_env} but it's not set"
+            )
+
+    return len(warnings) == 0, warnings
+
+
+def get_default_models(config_obj: Config) -> list[str]:
+    """
+    Get default models to use from config.
+
+    Prioritizes: claude, then any anthropic model, then first two available.
+    """
+    available = config_obj.list_models()
+
+    if not available:
+        return ["claude"]  # Fallback
+
+    # Prefer claude if available
+    defaults = []
+    if "claude" in available:
+        defaults.append("claude")
+
+    # Add second model if available
+    for model in available:
+        if model not in defaults:
+            defaults.append(model)
+            if len(defaults) >= 2:
+                break
+
+    return defaults if defaults else available[:2]
+
+
+def show_dry_run_info(
+    config_obj: Config,
+    models: list[str],
+    chairman: str,
+    task: str,
+    workspace_base
+) -> None:
+    """Display dry-run information without making API calls."""
+    ui.show_header("Dry Run", "Validating configuration")
+
+    ui.console.print(f"\n[bold]Task:[/bold] {task}")
+    ui.console.print(f"\n[bold]Configuration:[/bold]")
+    ui.console.print(f"  Models: {', '.join(models)}")
+    ui.console.print(f"  Chairman: {chairman}")
+    ui.console.print(f"  Output: {workspace_base}")
+
+    ui.console.print(f"\n[bold]Available Models in Config:[/bold]")
+    for name in config_obj.list_models():
+        model = config_obj.get_model(name)
+        if model:
+            key_status = ""
+            if model.api_key_env:
+                has_key = bool(os.environ.get(model.api_key_env))
+                key_status = f" [green]✓ {model.api_key_env}[/green]" if has_key else f" [red]✗ {model.api_key_env} not set[/red]"
+            elif model.provider == "ollama":
+                key_status = " [dim](local)[/dim]"
+            ui.console.print(f"  • {name}: {model.provider}/{model.model}{key_status}")
+
+    # Check API keys for requested models
+    keys_ok, key_warnings = check_api_keys(config_obj, models)
+    if not keys_ok:
+        ui.console.print(f"\n[bold yellow]API Key Warnings:[/bold yellow]")
+        for warning in key_warnings:
+            ui.console.print(f"  [yellow]⚠ {warning}[/yellow]")
+
+    ui.console.print(f"\n[bold green]✓ Configuration valid[/bold green]")
+    ui.console.print("[dim]Remove --dry-run to execute[/dim]")
 
 
 # =============================================================================
@@ -123,14 +246,20 @@ Examples:
     parser.add_argument(
         "--models",
         nargs="+",
-        default=["claude", "gpt4"],
-        help="Models to use for deliberation (default: claude gpt4)"
+        default=None,
+        help="Models to use for deliberation (default: from config file)"
     )
 
     parser.add_argument(
         "--chairman",
-        default="claude",
-        help="Model to use as chairman for synthesis (default: claude)"
+        default=None,
+        help="Model to use as chairman for synthesis (default: from config)"
+    )
+
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate config and show what would run without making API calls"
     )
 
     parser.add_argument(
@@ -237,7 +366,15 @@ async def run_quick_consensus(question: str, models: list[str]) -> None:
     ui.show_header("Quick Consensus")
     ui.console.print(f"[bold]Question:[/bold] {question}\n")
 
-    with ui.show_thinking("Gathering consensus..."):
+    # Create tracker for live progress
+    tracker = ui.TokenCostTracker()
+    total_models = len(models) if models else 2  # Default assumption
+
+    with ui.show_live_progress(
+        "Gathering consensus",
+        tracker,
+        total_models=total_models
+    ) as update:
         try:
             result = await quick_ask(question, models=models if models else None)
         except Exception as e:
@@ -299,8 +436,34 @@ async def run_session(
             ui.show_section("Phase 0: Role Deliberation")
             ui.console.print("[dim]Deliberating role assignments...[/dim]\n")
 
-            with ui.show_thinking("Models are proposing and critiquing..."):
-                role_result = await engine.deliberate_roles(task)
+            # Create tracker for live progress
+            tracker = ui.TokenCostTracker()
+            total_models = len(delib_config.proposal_models)
+
+            def on_progress(status: str, model_name: str, data: dict):
+                """Handle progress updates from deliberation."""
+                if status == "done":
+                    tracker.mark_model_done(model_name)
+                    tracker.update(
+                        input_t=data.get("tokens", 0) // 2,  # Rough split
+                        output_t=data.get("tokens", 0) // 2,
+                        cost=data.get("cost", 0.0)
+                    )
+
+            with ui.show_live_progress(
+                "Role deliberation",
+                tracker,
+                total_models=total_models
+            ) as update:
+                # Create a wrapper that updates the display
+                async def run_with_progress():
+                    result = await engine.deliberate_roles(
+                        task,
+                        progress_callback=on_progress
+                    )
+                    return result
+
+                role_result = await run_with_progress()
 
             session.set_role_assignments(role_result)
 
@@ -446,9 +609,29 @@ async def run_session(
         return session
 
     except KeyboardInterrupt:
-        ui.show_warning("\nSession interrupted by user")
+        ui.console.print()  # Clean line after ^C
+        ui.show_warning("Session interrupted")
+
+        # Show partial progress summary
+        if session.plan:
+            completed = len(session.completed_steps) if hasattr(session, 'completed_steps') else 0
+            total = session.plan.total_steps if hasattr(session.plan, 'total_steps') else len(session.plan.steps)
+            ui.console.print(f"[dim]Steps completed: {completed}/{total}[/dim]")
+
+        # Show files created if execution was in progress
+        if hasattr(session, 'execution_result') and session.execution_result:
+            files = session.execution_result.files_created
+            if files:
+                ui.console.print(f"[dim]Files created: {len(files)}[/dim]")
+
+        # Show token usage so far
+        if session.total_tokens > 0:
+            ui.console.print(f"[dim]Tokens used: {session.total_tokens:,} (${session.total_cost:.4f})[/dim]")
+
         transition_session(session, WorkflowPhase.ABORTED)
         manager.save(session)
+        ui.console.print(f"[dim]Session saved: {session.session_id}[/dim]")
+        ui.console.print("[dim]Resume with: council --resume " + session.session_id + "[/dim]")
         return session
 
     except Exception as e:
@@ -624,10 +807,36 @@ async def async_main(args: argparse.Namespace) -> int:
     # Determine output directory: CLI flag > config file > default
     workspace_base = args.output or config_obj.workspace.base_path
 
+    # Determine models: CLI flag > config defaults
+    models = args.models if args.models else get_default_models(config_obj)
+    chairman = args.chairman or config_obj.chairman.model
+
+    # Validate models exist in config
+    models_valid, model_errors = validate_models(config_obj, models + [chairman])
+    if not models_valid:
+        for error in model_errors:
+            ui.show_error(error)
+        return 1
+
+    # Check API keys (warning only, don't block)
+    keys_ok, key_warnings = check_api_keys(config_obj, models + [chairman])
+    if not keys_ok:
+        for warning in key_warnings:
+            ui.show_warning(warning)
+
+    # Handle --dry-run
+    if args.dry_run:
+        show_dry_run_info(config_obj, models, chairman, task, workspace_base)
+        return 0
+
+    if args.verbose:
+        ui.show_info(f"Using models: {', '.join(models)}")
+        ui.show_info(f"Chairman: {chairman}")
+
     delib_config = DeliberationConfig(
-        chairman_model=args.chairman or config_obj.chairman.model,
-        proposal_models=args.models,
-        critique_models=args.models,
+        chairman_model=chairman,
+        proposal_models=models,
+        critique_models=models,
     )
 
     # Run the session

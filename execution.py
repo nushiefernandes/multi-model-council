@@ -464,7 +464,8 @@ class ToolImplementations:
         language: str,
         context_files: Optional[list[str]] = None,
         context: ExecutionContext = None,
-        provider: Optional[ModelProvider] = None
+        provider: Optional[ModelProvider] = None,
+        on_chunk: Optional[Callable[[str], None]] = None
     ) -> str:
         """
         Have a model generate code based on description.
@@ -475,6 +476,7 @@ class ToolImplementations:
             context_files: Files to include as context
             context: Execution context
             provider: Model provider to use for generation
+            on_chunk: Optional callback for streaming chunks (real-time display)
 
         Returns:
             Generated code
@@ -502,13 +504,33 @@ class ToolImplementations:
 
 Return ONLY the code, no explanations or markdown code blocks."""
 
-        result = await provider.complete(
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.3
-        )
+        # Use streaming if callback provided and provider supports it
+        if on_chunk and hasattr(provider, 'stream'):
+            chunks = []
+            try:
+                async for chunk in provider.stream(
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.3
+                ):
+                    chunks.append(chunk)
+                    on_chunk(chunk)
+                code = "".join(chunks)
+            except (AttributeError, NotImplementedError):
+                # Fall back to non-streaming if stream() not implemented
+                result = await provider.complete(
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.3
+                )
+                code = result["content"]
+        else:
+            # Non-streaming path
+            result = await provider.complete(
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3
+            )
+            code = result["content"]
 
         # Strip any markdown code blocks the model might add
-        code = result["content"]
         code = re.sub(r'^```\w*\n', '', code)
         code = re.sub(r'\n```$', '', code)
 

@@ -26,7 +26,7 @@ import asyncio
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Type, TypeVar, Optional
+from typing import Type, TypeVar, Optional, Callable
 
 from pydantic import BaseModel
 
@@ -179,7 +179,8 @@ class Deliberation:
     async def gather_proposals(
         self,
         task: str,
-        context: str = ""
+        context: str = "",
+        progress_callback: Optional[Callable[[str, str, dict], None]] = None
     ) -> tuple[list[tuple[str, Proposal]], list[AgentResponse]]:
         """
         Collect proposals from all configured models in parallel.
@@ -189,6 +190,11 @@ class Deliberation:
         Args:
             task: The task description to propose solutions for
             context: Additional context about the task
+            progress_callback: Optional callback for progress updates.
+                              Called with (status, model_name, data) where:
+                              - status: "waiting" | "done" | "error"
+                              - model_name: Name of the model
+                              - data: Dict with tokens/cost info (for "done")
 
         Returns:
             tuple of (list of (model_name, Proposal), list of AgentResponse metadata)
@@ -209,6 +215,9 @@ Please propose your approach to this task. Consider:
 
         # Gather proposals in parallel
         async def get_proposal(model_name: str) -> tuple[str, Proposal, AgentResponse]:
+            if progress_callback:
+                progress_callback("waiting", model_name, {})
+
             agent = self._get_agent(model_name)
             proposal, response_meta = await self._agent_respond_structured(
                 agent=agent,
@@ -217,6 +226,13 @@ Please propose your approach to this task. Consider:
                 system=system_prompt,
                 context=context
             )
+
+            if progress_callback:
+                progress_callback("done", model_name, {
+                    "tokens": response_meta.tokens_used,
+                    "cost": response_meta.cost
+                })
+
             return model_name, proposal, response_meta
 
         # Run all proposals in parallel
@@ -229,8 +245,11 @@ Please propose your approach to this task. Consider:
         # Filter out exceptions and collect results
         proposals = []
         responses = []
-        for result in results:
+        for i, result in enumerate(results):
             if isinstance(result, Exception):
+                model_name = self.delib_config.proposal_models[i]
+                if progress_callback:
+                    progress_callback("error", model_name, {"error": str(result)})
                 print(f"Warning: Proposal failed: {result}")
                 continue
             model_name, proposal, response_meta = result
@@ -245,13 +264,19 @@ Please propose your approach to this task. Consider:
 
     async def cross_critique(
         self,
-        proposals: list[tuple[str, Proposal]]
+        proposals: list[tuple[str, Proposal]],
+        progress_callback: Optional[Callable[[str, str, dict], None]] = None
     ) -> tuple[list[tuple[str, Critique]], list[AgentResponse]]:
         """
         Each model critiques the proposals from other models.
 
         Args:
             proposals: List of (model_name, Proposal) tuples
+            progress_callback: Optional callback for progress updates.
+                              Called with (status, model_name, data) where:
+                              - status: "waiting" | "done" | "error"
+                              - model_name: Name of the model
+                              - data: Dict with tokens/cost info (for "done")
 
         Returns:
             tuple of (list of (critic_model, Critique), list of AgentResponse metadata)
@@ -286,6 +311,9 @@ Focus on the most significant proposal or the one you have the strongest opinion
 
         # Gather critiques in parallel
         async def get_critique(model_name: str) -> tuple[str, Critique, AgentResponse]:
+            if progress_callback:
+                progress_callback("waiting", model_name, {})
+
             agent = self._get_agent(model_name)
             critique, response_meta = await self._agent_respond_structured(
                 agent=agent,
@@ -293,6 +321,13 @@ Focus on the most significant proposal or the one you have the strongest opinion
                 schema=Critique,
                 system=system_prompt
             )
+
+            if progress_callback:
+                progress_callback("done", model_name, {
+                    "tokens": response_meta.tokens_used,
+                    "cost": response_meta.cost
+                })
+
             return model_name, critique, response_meta
 
         tasks = [
@@ -303,8 +338,11 @@ Focus on the most significant proposal or the one you have the strongest opinion
 
         critiques = []
         responses = []
-        for result in results:
+        for i, result in enumerate(results):
             if isinstance(result, Exception):
+                model_name = self.delib_config.critique_models[i]
+                if progress_callback:
+                    progress_callback("error", model_name, {"error": str(result)})
                 print(f"Warning: Critique failed: {result}")
                 continue
             model_name, critique, response_meta = result
@@ -406,7 +444,12 @@ Make the final role assignments."""
     # FULL DELIBERATION FLOWS
     # =========================================================================
 
-    async def deliberate_roles(self, task: str, context: str = "") -> RoleDeliberationResult:
+    async def deliberate_roles(
+        self,
+        task: str,
+        context: str = "",
+        progress_callback: Optional[Callable[[str, str, dict], None]] = None
+    ) -> RoleDeliberationResult:
         """
         Full role deliberation flow: propose -> critique -> synthesize.
 
@@ -415,6 +458,11 @@ Make the final role assignments."""
         Args:
             task: The task to deliberate roles for
             context: Additional context
+            progress_callback: Optional callback for progress updates.
+                              Called with (status, model_name, data) where:
+                              - status: "waiting" | "done" | "error"
+                              - model_name: Name of the model
+                              - data: Dict with tokens/cost info (for "done")
 
         Returns:
             RoleDeliberationResult with actual assignments (not hardcoded!)
@@ -425,7 +473,9 @@ Make the final role assignments."""
 
         # Phase 1: Gather proposals
         phase_start = time.time()
-        proposals, proposal_responses = await self.gather_proposals(task, context)
+        proposals, proposal_responses = await self.gather_proposals(
+            task, context, progress_callback=progress_callback
+        )
         phases.append(DeliberationPhase(
             phase_name="proposals",
             responses=proposal_responses,
@@ -434,7 +484,9 @@ Make the final role assignments."""
 
         # Phase 2: Cross-critique
         phase_start = time.time()
-        critiques, critique_responses = await self.cross_critique(proposals)
+        critiques, critique_responses = await self.cross_critique(
+            proposals, progress_callback=progress_callback
+        )
         phases.append(DeliberationPhase(
             phase_name="critiques",
             responses=critique_responses,

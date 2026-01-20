@@ -943,16 +943,42 @@ def get_provider(config: dict, provider_name: str) -> ModelProvider:
             model: "deepseek-coder-v2:16b"
     """
     provider_config = config.get("models", {}).get(provider_name, {})
+
+    # Better error when model not found in config
+    if not provider_config:
+        available = list(config.get("models", {}).keys())
+        raise ValueError(
+            f"Model '{provider_name}' not found in config. "
+            f"Available models: {', '.join(available) or 'none'}"
+        )
+
     provider_type = provider_config.get("provider", "")
 
+    # Better error for missing/invalid provider type
+    if provider_type not in ("anthropic", "openai", "ollama"):
+        raise ValueError(
+            f"Model '{provider_name}' has invalid provider type: '{provider_type}'. "
+            f"Must be one of: anthropic, openai, ollama"
+        )
+
     if provider_type == "anthropic":
-        api_key = os.environ.get(provider_config.get("api_key_env", "ANTHROPIC_API_KEY"))
+        api_key_env = provider_config.get("api_key_env", "ANTHROPIC_API_KEY")
+        api_key = os.environ.get(api_key_env)
+        if not api_key:
+            raise ValueError(
+                f"Model '{provider_name}' requires {api_key_env} but it's not set"
+            )
         return AnthropicProvider(
             model=provider_config.get("model", "claude-sonnet-4-20250514"),
             api_key=api_key
         )
     elif provider_type == "openai":
-        api_key = os.environ.get(provider_config.get("api_key_env", "OPENAI_API_KEY"))
+        api_key_env = provider_config.get("api_key_env", "OPENAI_API_KEY")
+        api_key = os.environ.get(api_key_env)
+        if not api_key:
+            raise ValueError(
+                f"Model '{provider_name}' requires {api_key_env} but it's not set"
+            )
         return OpenAIProvider(
             model=provider_config.get("model", "gpt-5.2"),
             api_key=api_key
@@ -962,8 +988,6 @@ def get_provider(config: dict, provider_name: str) -> ModelProvider:
             model=provider_config.get("model", "deepseek-coder-v2:16b"),
             base_url=provider_config.get("base_url", "http://localhost:11434")
         )
-    else:
-        raise ValueError(f"Unknown provider type: {provider_type}")
 
 
 # =============================================================================

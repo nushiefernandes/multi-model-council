@@ -195,10 +195,21 @@ def get_default_config() -> Config:
 # CONFIGURATION LOADING
 # =============================================================================
 
-def _parse_model_config(data: dict) -> ModelConfig:
+def _parse_model_config(name: str, data: dict) -> ModelConfig:
     """Parse a model configuration from dict."""
+    import warnings
+
+    provider = data.get("provider")
+    if not provider:
+        warnings.warn(
+            f"Model '{name}' missing 'provider' field, defaulting to 'anthropic'",
+            UserWarning,
+            stacklevel=4
+        )
+        provider = "anthropic"
+
     return ModelConfig(
-        provider=data.get("provider", "anthropic"),
+        provider=provider,
         model=data.get("model", "claude-sonnet-4-20250514"),
         api_key_env=data.get("api_key_env"),
         base_url=data.get("base_url"),
@@ -213,7 +224,7 @@ def _parse_config(data: dict) -> Config:
     if "models" in data:
         config.models = {}
         for name, model_data in data["models"].items():
-            config.models[name] = _parse_model_config(model_data)
+            config.models[name] = _parse_model_config(name, model_data)
 
     # Parse chairman
     if "chairman" in data:
