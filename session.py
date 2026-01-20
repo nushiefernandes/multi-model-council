@@ -393,9 +393,9 @@ class WorkflowPhase:
 
 # Valid phase transitions
 PHASE_TRANSITIONS = {
-    WorkflowPhase.INITIALIZED: [WorkflowPhase.ROLE_DELIBERATION],
+    WorkflowPhase.INITIALIZED: [WorkflowPhase.ROLE_DELIBERATION, WorkflowPhase.PLANNING],
     WorkflowPhase.ROLE_DELIBERATION: [WorkflowPhase.PLANNING, WorkflowPhase.FAILED, WorkflowPhase.ABORTED],
-    WorkflowPhase.PLANNING: [WorkflowPhase.EXECUTION, WorkflowPhase.ROLE_DELIBERATION, WorkflowPhase.FAILED, WorkflowPhase.ABORTED],
+    WorkflowPhase.PLANNING: [WorkflowPhase.EXECUTION, WorkflowPhase.COMPLETE, WorkflowPhase.ROLE_DELIBERATION, WorkflowPhase.FAILED, WorkflowPhase.ABORTED],
     WorkflowPhase.EXECUTION: [WorkflowPhase.REVIEW, WorkflowPhase.PLANNING, WorkflowPhase.FAILED, WorkflowPhase.ABORTED],
     WorkflowPhase.REVIEW: [WorkflowPhase.COMPLETE, WorkflowPhase.EXECUTION, WorkflowPhase.FAILED, WorkflowPhase.ABORTED],
     WorkflowPhase.COMPLETE: [],

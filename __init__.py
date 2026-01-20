@@ -12,6 +12,7 @@ Phase 1: Schemas and Providers (complete)
 Phase 2: Real Deliberation Engine (complete)
 Phase 3: Execution Layer (complete)
 Phase 4: CLI Interface (complete)
+Phase 5: Workspace & Config (complete)
 """
 
 __version__ = "2.0.0-alpha"
@@ -68,6 +69,21 @@ from .session import (
 
 from .cli import main as cli_main
 
+from .config import (
+    Config,
+    ModelConfig,
+    ChairmanConfig,
+    WorkspaceConfig,
+    load_config,
+    get_default_config,
+    save_config,
+)
+
+from .workspace import (
+    WorkspaceManager,
+    create_workspace,
+)
+
 __all__ = [
     # Schemas
     "Proposal",
@@ -110,4 +126,15 @@ __all__ = [
     "list_sessions",
     # CLI
     "cli_main",
+    # Config
+    "Config",
+    "ModelConfig",
+    "ChairmanConfig",
+    "WorkspaceConfig",
+    "load_config",
+    "get_default_config",
+    "save_config",
+    # Workspace
+    "WorkspaceManager",
+    "create_workspace",
 ]

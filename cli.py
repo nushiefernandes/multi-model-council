@@ -56,6 +56,12 @@ from session import (
     transition_session,
     get_next_phase,
 )
+from config import (
+    Config,
+    load_config,
+    get_default_config as get_default_config_obj,
+)
+from workspace import WorkspaceManager
 import ui
 
 
@@ -151,6 +157,19 @@ Examples:
         help="Show detailed output"
     )
 
+    # Output and config options
+    parser.add_argument(
+        "-o", "--output",
+        type=Path,
+        help="Output directory for generated files (default: ./council-output)"
+    )
+
+    parser.add_argument(
+        "-c", "--config",
+        type=Path,
+        help="Path to config file (default: ~/.council/config.yaml)"
+    )
+
     parser.add_argument(
         "--version",
         action="version",
@@ -235,7 +254,8 @@ async def run_session(
     interactive: bool = True,
     skip_roles: bool = False,
     skip_execution: bool = False,
-    verbose: bool = False
+    verbose: bool = False,
+    workspace_base: Optional[Path] = None
 ) -> Session:
     """
     Run a full deliberation session.
@@ -247,6 +267,16 @@ async def run_session(
     4. Review
 
     Each phase has checkpoints where the user can approve or provide feedback.
+
+    Args:
+        task: The task description
+        config: Model configuration dict
+        delib_config: Deliberation configuration
+        interactive: Whether to use interactive checkpoints
+        skip_roles: Skip role deliberation phase
+        skip_execution: Stop after planning
+        verbose: Show detailed output
+        workspace_base: Output directory for generated files
     """
     # Create session
     manager = SessionManager()
@@ -334,14 +364,17 @@ async def run_session(
         ui.show_section("Phase 2: Execution")
         ui.console.print(f"[dim]Executing {plan.total_steps} steps...[/dim]\n")
 
+        # Determine output directory
+        output_dir = workspace_base or Path("./council-output")
+        ui.console.print(f"[dim]Output directory: {output_dir}[/dim]\n")
+
         # Create execution engine with checkpoint callback
-        workspace_base = Path.home() / ".council" / "v2" / "workspaces"
         checkpoint_callback = create_checkpoint_callback() if interactive else None
 
         exec_result = await execute_plan_interactive(
             plan=plan,
             config=config,
-            workspace_base=workspace_base,
+            workspace_base=output_dir,
             checkpoint_callback=checkpoint_callback
         )
 
@@ -466,9 +499,16 @@ async def resume_session(session_id: str, interactive: bool = True) -> Session:
         return session
 
     # Re-run the session from the current phase
-    config = session.config or create_default_config()
+    # Use stored session config if available, otherwise load from file/defaults
+    if session.config:
+        config = session.config
+        config_obj = get_default_config_obj()  # For workspace settings
+    else:
+        config_obj = load_config()
+        config = config_obj.to_provider_config()
+
     delib_config = DeliberationConfig(
-        chairman_model=config.get("chairman", "claude"),
+        chairman_model=config.get("chairman", config_obj.chairman.model),
         proposal_models=config.get("models", ["claude", "gpt4"]),
         critique_models=config.get("models", ["claude", "gpt4"]),
     )
@@ -486,6 +526,7 @@ async def resume_session(session_id: str, interactive: bool = True) -> Session:
         interactive=interactive,
         skip_roles=skip_roles,
         skip_execution=False,
+        workspace_base=config_obj.workspace.base_path,
     )
 
 
@@ -565,10 +606,26 @@ async def async_main(args: argparse.Namespace) -> int:
         ui.show_quick_help()
         return 0
 
-    # Create configuration
-    config = create_default_config()
+    # Load configuration from file or defaults
+    try:
+        config_obj = load_config(args.config) if args.config else load_config()
+        if args.verbose:
+            ui.show_info(f"Loaded config with models: {config_obj.list_models()}")
+    except FileNotFoundError as e:
+        ui.show_error(f"Config file not found: {e}")
+        return 1
+    except Exception as e:
+        ui.show_warning(f"Failed to load config, using defaults: {e}")
+        config_obj = get_default_config_obj()
+
+    # Convert to provider config dict (for backwards compatibility)
+    config = config_obj.to_provider_config()
+
+    # Determine output directory: CLI flag > config file > default
+    workspace_base = args.output or config_obj.workspace.base_path
+
     delib_config = DeliberationConfig(
-        chairman_model=args.chairman,
+        chairman_model=args.chairman or config_obj.chairman.model,
         proposal_models=args.models,
         critique_models=args.models,
     )
@@ -583,6 +640,7 @@ async def async_main(args: argparse.Namespace) -> int:
             skip_roles=args.skip_roles,
             skip_execution=args.skip_execution,
             verbose=args.verbose,
+            workspace_base=workspace_base,
         )
         return 0
     except KeyboardInterrupt:

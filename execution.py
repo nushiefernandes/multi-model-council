@@ -67,6 +67,7 @@ from schemas import (
     ExecutionResult,
 )
 from providers import ModelProvider, get_provider
+from workspace import WorkspaceManager
 
 T = TypeVar('T', bound=BaseModel)
 
@@ -250,17 +251,24 @@ class ToolImplementations:
     - Access sensitive files outside the project
 
     We restrict all operations to workspace_path.
+
+    WORKSPACE MANAGER INTEGRATION:
+    -----------------------------
+    When a WorkspaceManager is provided, file operations use its methods
+    for automatic organization (placing files in src/, tests/, docs/ etc).
     """
 
-    def __init__(self, workspace_path: Path):
+    def __init__(self, workspace_path: Path, workspace_manager=None):
         """
         Initialize implementations with a workspace.
 
         Args:
             workspace_path: All file operations are restricted to this directory
+            workspace_manager: Optional WorkspaceManager for auto-organization
         """
         self.workspace = Path(workspace_path).resolve()
         self.workspace.mkdir(parents=True, exist_ok=True)
+        self._workspace_manager = workspace_manager
 
     def _resolve_path(self, path: str) -> Path:
         """
@@ -306,6 +314,14 @@ class ToolImplementations:
         Returns:
             Confirmation message with path
         """
+        # Use workspace manager if available for auto-organization
+        if self._workspace_manager:
+            rel_path = self._workspace_manager.write_file(path, content)
+            if rel_path not in context.created_files:
+                context.created_files.append(rel_path)
+            return f"Successfully wrote {len(content)} characters to {rel_path}"
+
+        # Fall back to direct file operations
         full_path = self._resolve_path(path)
 
         # Create parent directories
@@ -339,6 +355,10 @@ class ToolImplementations:
         Raises:
             FileNotFoundError: If file doesn't exist
         """
+        # Use workspace manager if available
+        if self._workspace_manager:
+            return self._workspace_manager.read_file(path)
+
         full_path = self._resolve_path(path)
 
         if not full_path.exists():
@@ -543,14 +563,18 @@ Return ONLY the code, no explanations or markdown code blocks."""
         return "\n".join(results[:50])  # Limit results
 
 
-def create_default_tools(workspace_path: Path) -> tuple[ToolRegistry, ToolImplementations]:
+def create_default_tools(workspace_path: Path, workspace_manager=None) -> tuple[ToolRegistry, ToolImplementations]:
     """
     Create a registry with default tools.
 
     This is the standard set of tools available to agents.
+
+    Args:
+        workspace_path: Path for file operations
+        workspace_manager: Optional WorkspaceManager for auto-organization
     """
     registry = ToolRegistry()
-    implementations = ToolImplementations(workspace_path)
+    implementations = ToolImplementations(workspace_path, workspace_manager=workspace_manager)
 
     # Register file_write
     registry.register(
@@ -1174,11 +1198,18 @@ class ExecutionEngine:
         """
         # Setup
         session_id = session_id or str(uuid.uuid4())[:8]
-        workspace_path = (self.workspace_base / f"session_{session_id}").resolve()
-        workspace_path.mkdir(parents=True, exist_ok=True)
 
-        # Update tool implementations workspace (resolve to handle symlinks)
+        # Create workspace manager for organized output
+        workspace_manager = WorkspaceManager(
+            output_path=self.workspace_base,
+            session_id=session_id,
+            include_timestamp=False  # Keep paths predictable
+        )
+        workspace_path = workspace_manager.setup()
+
+        # Update tool implementations with workspace manager
         self.tool_implementations.workspace = workspace_path.resolve()
+        self.tool_implementations._workspace_manager = workspace_manager
 
         # Initialize context
         context = ExecutionContext(
@@ -1253,6 +1284,9 @@ class ExecutionEngine:
         self._transcript.total_cost = sum(
             sr.cost for sr in self._transcript.step_results
         )
+
+        # Finalize workspace and get stats
+        workspace_manager.finalize()
 
         # Build result
         return ExecutionResult(
