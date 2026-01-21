@@ -47,8 +47,77 @@ from schemas import (
     ConsensusResult,
 )
 from providers import ModelProvider, get_provider
+import random
 
 T = TypeVar('T', bound=BaseModel)
+
+
+# =============================================================================
+# ANONYMIZATION HELPERS
+# =============================================================================
+
+def anonymize_proposals(
+    proposals: list[tuple[str, Proposal]]
+) -> tuple[list[tuple[str, Proposal]], dict[str, str]]:
+    """
+    Shuffle and anonymize proposals for unbiased critique and synthesis.
+
+    This ensures the chairman/critics don't know which model proposed what,
+    reducing bias toward known-strong models (à la Karpathy's approach).
+
+    Args:
+        proposals: List of (model_name, Proposal) tuples
+
+    Returns:
+        - Anonymized list with labels (Model A, Model B, etc.)
+        - Mapping dict to de-anonymize later {label: real_model}
+    """
+    labels = ["Model A", "Model B", "Model C", "Model D", "Model E"]
+    shuffled = proposals.copy()
+    random.shuffle(shuffled)
+
+    mapping = {}
+    anonymized = []
+    for i, (model_name, proposal) in enumerate(shuffled):
+        if i >= len(labels):
+            label = f"Model {chr(65 + i)}"  # A, B, C, D, E, F...
+        else:
+            label = labels[i]
+        mapping[label] = model_name
+        anonymized.append((label, proposal))
+
+    return anonymized, mapping
+
+
+def deanonymize_result(
+    result: RoleDeliberationResult,
+    mapping: dict[str, str]
+) -> RoleDeliberationResult:
+    """
+    Convert anonymized labels back to real model names in the result.
+
+    Args:
+        result: RoleDeliberationResult with anonymized model names
+        mapping: {label: real_model} mapping from anonymize_proposals()
+
+    Returns:
+        RoleDeliberationResult with real model names
+    """
+    # Update assignments with real model names
+    updated_assignments = []
+    for assignment in result.assignments:
+        real_model = mapping.get(assignment.assigned_to, assignment.assigned_to)
+        updated_assignments.append(RoleAssignment(
+            role=assignment.role,
+            assigned_to=real_model,
+            reasoning=assignment.reasoning
+        ))
+
+    return RoleDeliberationResult(
+        assignments=updated_assignments,
+        consensus_notes=result.consensus_notes,
+        dissenting_views=result.dissenting_views
+    )
 
 
 @dataclass
@@ -350,6 +419,135 @@ Focus on the most significant proposal or the one you have the strongest opinion
             responses.append(response_meta)
 
         return critiques, responses
+
+    # =========================================================================
+    # PHASE 2.5: CHAIRMAN VOTE (Optional)
+    # =========================================================================
+
+    async def vote_for_chairman(
+        self,
+        proposals: list[tuple[str, Proposal]],
+        critiques: list[tuple[str, Critique]],
+        progress_callback: Optional[Callable[[str, str, dict], None]] = None
+    ) -> tuple[str, dict[str, str]]:
+        """
+        Models vote on who should be the chairman (synthesizer).
+
+        Each model reviews the proposals and critiques, then votes for which
+        model should synthesize the final decision. This enables democratic
+        chairman selection rather than hardcoding.
+
+        Args:
+            proposals: Anonymized proposals (Model A, Model B, etc.)
+            critiques: Critiques from cross_critique
+            progress_callback: Optional progress callback
+
+        Returns:
+            tuple of (winning_model_label, votes_dict)
+            - winning_model_label: "Model A", "Model B", etc.
+            - votes_dict: {"Model A": "Model B", ...} showing who voted for whom
+        """
+        system_prompt = """You are voting on which model should synthesize the final decision.
+Based on the quality of proposals and critiques, vote for the model whose proposal
+demonstrates the best judgment and should be trusted to make the final synthesis.
+
+You MUST vote for a model OTHER than yourself. Do not vote for your own proposal."""
+
+        # Format proposals and critiques for voting
+        proposals_text = ""
+        for label, prop in proposals:
+            proposals_text += f"""
+{label}'s Proposal:
+- Approach: {prop.approach}
+- Rationale: {prop.rationale}
+- Risks: {', '.join(prop.risks) if prop.risks else 'None'}
+- Confidence: {prop.confidence}/10
+"""
+
+        critiques_text = ""
+        for label, crit in critiques:
+            critiques_text += f"""
+{label}'s Critique:
+- Agrees: {', '.join(crit.agrees[:2]) if crit.agrees else 'None'}
+- Disagrees: {', '.join(crit.disagrees[:2]) if crit.disagrees else 'None'}
+- Recommendation: {crit.recommendation}
+"""
+
+        prompt = f"""Review these proposals and critiques:
+
+PROPOSALS:
+{proposals_text}
+
+CRITIQUES:
+{critiques_text}
+
+Based on the quality of reasoning demonstrated, which model should be the chairman
+who synthesizes the final decision?
+
+Respond with ONLY the model label (e.g., "Model A" or "Model B"). Nothing else."""
+
+        # Collect votes from each model
+        votes = {}
+        voter_labels = [label for label, _ in proposals]
+
+        async def get_vote(voter_model: str, voter_label: str) -> tuple[str, str]:
+            if progress_callback:
+                progress_callback("waiting", voter_label, {})
+
+            agent = self._get_agent(voter_model)
+            result = await agent.provider.complete(
+                messages=[{"role": "user", "content": prompt}],
+                system=system_prompt,
+                max_tokens=50,
+                temperature=0.1
+            )
+
+            if progress_callback:
+                progress_callback("done", voter_label, {
+                    "tokens": result.get("input_tokens", 0) + result.get("output_tokens", 0)
+                })
+
+            # Extract vote from response
+            vote_text = result["content"].strip()
+            # Find which model label was voted for
+            for label in voter_labels:
+                if label.lower() in vote_text.lower():
+                    return voter_label, label
+
+            # Default to first non-self model if unclear
+            for label in voter_labels:
+                if label != voter_label:
+                    return voter_label, label
+
+            return voter_label, voter_labels[0]
+
+        # Get real model names for voting
+        # We need to map labels back to models for API calls
+        # For now, use the proposal_models in order
+        tasks = []
+        for i, (label, _) in enumerate(proposals):
+            if i < len(self.delib_config.proposal_models):
+                model_name = self.delib_config.proposal_models[i]
+                tasks.append(get_vote(model_name, label))
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for result in results:
+            if isinstance(result, Exception):
+                print(f"Warning: Vote failed: {result}")
+                continue
+            voter, voted_for = result
+            votes[voter] = voted_for
+
+        # Tally votes
+        vote_counts = {}
+        for voted_for in votes.values():
+            vote_counts[voted_for] = vote_counts.get(voted_for, 0) + 1
+
+        # Find winner (most votes)
+        winner = max(vote_counts.keys(), key=lambda k: vote_counts[k]) if vote_counts else voter_labels[0]
+
+        return winner, votes
 
     # =========================================================================
     # PHASE 3: SYNTHESIZE ASSIGNMENTS
